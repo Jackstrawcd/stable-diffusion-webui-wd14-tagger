@@ -474,7 +474,7 @@ class WaifuDiffusionInterrogator(Interrogator):
             url = f"{OBS_WD_BASE_URL}/{relative_path}/{self.tags_path}"
             http_down(url, tags_path)
 
-        return tags_path, model_path
+        return model_path, tags_path
 
     def load(self) -> None:
         model_path, tags_path = self.download()
