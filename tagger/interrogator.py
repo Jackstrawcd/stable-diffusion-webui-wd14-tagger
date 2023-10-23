@@ -7,6 +7,8 @@ import inspect
 from re import match as re_match
 from platform import system, uname
 from typing import Tuple, List, Dict, Callable
+
+import requests
 from pandas import read_csv
 from PIL import Image, UnidentifiedImageError
 from numpy import asarray, float32, expand_dims, exp
@@ -14,7 +16,7 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 from modules.paths import extensions_dir
-from modules import shared
+from modules import shared, paths
 from tagger import settings  # pylint: disable=import-error
 from tagger.uiset import QData, IOData  # pylint: disable=import-error
 from . import dbimutils  # pylint: disable=import-error # noqa
@@ -29,13 +31,14 @@ use_cpu = ('all' in shared.cmd_opts.use_cpu) or (
 # https://github.com/toriato/stable-diffusion-webui-wd14-tagger/commit/e4ec460122cf674bbf984df30cdb10b4370c1224#r92654958
 onnxrt_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
 
-if shared.cmd_opts.additional_device_ids is not None:
-    m = re_match(r'([cg])pu:\d+$', shared.cmd_opts.additional_device_ids)
+additional_device_ids = getattr(shared.cmd_opts, 'additional_device_ids', None)
+if additional_device_ids is not None:
+    m = re_match(r'([cg])pu:\d+$', additional_device_ids)
     if m is None:
         raise ValueError('--device-id is not cpu:<nr> or gpu:<nr>')
     if m.group(1) == 'c':
         onnxrt_providers.pop(0)
-    TF_DEVICE_NAME = f'/{shared.cmd_opts.additional_device_ids}'
+    TF_DEVICE_NAME = f'/{additional_device_ids}'
 elif use_cpu:
     TF_DEVICE_NAME = '/cpu:0'
     onnxrt_providers.pop(0)
@@ -369,6 +372,7 @@ class WaifuDiffusionInterrogator(Interrogator):
         tags_path='selected_tags.csv',
         repo_id=None,
         is_hf=True,
+        **kwargs
     ) -> None:
         super().__init__(name)
         self.repo_id = repo_id
@@ -380,52 +384,97 @@ class WaifuDiffusionInterrogator(Interrogator):
         self.local_model = None
         self.local_tags = None
         self.is_hf = is_hf
+        self.kwargs = kwargs
 
-    def download(self) -> None:
-        mdir = Path(shared.models_path, 'interrogators')
-        if self.is_hf:
-            cache = getattr(shared.opts, 'tagger_hf_cache_dir', Its.hf_cache)
-            print(f"Loading {self.name} model file from {self.repo_id}, "
-                  f"{self.model_path}")
+    # def download(self) -> None:
+    #     mdir = Path(shared.models_path, 'interrogators')
+    #     if self.is_hf:
+    #         cache = getattr(shared.opts, 'tagger_hf_cache_dir', Its.hf_cache)
+    #         print(f"Loading {self.name} model file from {self.repo_id}, "
+    #               f"{self.model_path}")
+    #
+    #         model_path = hf_hub_download(
+    #             repo_id=self.repo_id,
+    #             filename=self.model_path,
+    #             cache_dir=cache)
+    #         tags_path = hf_hub_download(
+    #             repo_id=self.repo_id,
+    #             filename=self.tags_path,
+    #             cache_dir=cache)
+    #     else:
+    #         model_path = self.local_model
+    #         tags_path = self.local_tags
+    #
+    #     download_model = {
+    #         'name': self.name,
+    #         'model_path': model_path,
+    #         'tags_path': tags_path,
+    #     }
+    #     mpath = Path(mdir, 'model.json')
+    #
+    #     data = [download_model]
+    #
+    #     if not os.path.exists(mdir):
+    #         os.mkdir(mdir)
+    #
+    #     elif os.path.exists(mpath):
+    #         with io.open(file=mpath, mode='r', encoding='utf-8') as filename:
+    #             try:
+    #                 data = json.load(filename)
+    #                 # No need to append if it's already contained
+    #                 if download_model not in data:
+    #                     data.append(download_model)
+    #             except json.JSONDecodeError as err:
+    #                 print(f'Adding download_model {mpath} raised {repr(err)}')
+    #                 data = [download_model]
+    #
+    #     with io.open(mpath, 'w', encoding='utf-8') as filename:
+    #         json.dump(data, filename)
+    #     return model_path, tags_path
 
-            model_path = hf_hub_download(
-                repo_id=self.repo_id,
-                filename=self.model_path,
-                cache_dir=cache)
-            tags_path = hf_hub_download(
-                repo_id=self.repo_id,
-                filename=self.tags_path,
-                cache_dir=cache)
-        else:
-            model_path = self.local_model
-            tags_path = self.local_tags
+    def download(self):
 
-        download_model = {
-            'name': self.name,
-            'model_path': model_path,
-            'tags_path': tags_path,
-        }
-        mpath = Path(mdir, 'model.json')
+        OBS_WD_BASE_URL = 'https://xingzheassert.obs.cn-north-4.myhuaweicloud.com/wd-tagger'
 
-        data = [download_model]
+        def http_down(url, local):
+            print(f'>> download {url} to {local}')
+            dirname = os.path.dirname(local)
+            os.makedirs(dirname, exist_ok=True)
+            resp = requests.get(url, timeout=10)
+            if resp.ok:
+                chunk_size = 512
+                current = 0
+                with open(local, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            current += chunk_size
+            print(f">>> {os.path.isfile(local)}")
 
-        if not os.path.exists(mdir):
-            os.mkdir(mdir)
+        name = self.name.lower().replace(' ', '-')
+        dir_path = os.path.join(paths.models_path, 'tag_models', name)
+        revision = self.kwargs.get('revision', '')
 
-        elif os.path.exists(mpath):
-            with io.open(file=mpath, mode='r', encoding='utf-8') as filename:
-                try:
-                    data = json.load(filename)
-                    # No need to append if it's already contained
-                    if download_model not in data:
-                        data.append(download_model)
-                except json.JSONDecodeError as err:
-                    print(f'Adding download_model {mpath} raised {repr(err)}')
-                    data = [download_model]
+        # wd-tagger/wd14-vit-v2/main/model.onnx
+        # wd-tagger/wd14-vit-v2/v2.0/model.onnx
+        if not revision:
+            revision = 'main'
 
-        with io.open(mpath, 'w', encoding='utf-8') as filename:
-            json.dump(data, filename)
-        return model_path, tags_path
+        os.makedirs(dir_path, exist_ok=True)
+        model_path = os.path.join(dir_path, revision, self.model_path)
+        tags_path = os.path.join(dir_path, revision, self.tags_path)
+        relative_path = os.path.join(name, revision)
+
+        if not os.path.isdir(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+        if not os.path.isfile(model_path):
+            url = f"{OBS_WD_BASE_URL}/{relative_path}/{self.model_path}"
+            http_down(url, model_path)
+        if not os.path.isfile(tags_path):
+            url = f"{OBS_WD_BASE_URL}/{relative_path}/{self.tags_path}"
+            http_down(url, tags_path)
+
+        return tags_path, model_path
 
     def load(self) -> None:
         model_path, tags_path = self.download()
